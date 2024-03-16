@@ -165,6 +165,24 @@ void PulseHandlerKeepOn() {
 	}
 }
 
+void PrintRate( uint8_t rate ) {
+
+	// Find tens, and ones digit separately (hundreds is either 1 or 0)
+	uint8_t tens = (rate % 100) / 10;
+	uint8_t ones = (rate % 100) % 10;
+
+	//queue_len = 0;	// Reset queue?
+	ResetIndexes();
+	TurnAllOff();
+
+	if (rate >= 100) {
+		AddToLEDQueue(one_hundreds, 2);
+	}
+	AddToLEDQueue(tens_digits[tens], digit_sizes[tens]);
+	AddToLEDQueue(ones_digits[ones], digit_sizes[ones]);
+
+}
+
 void TurnAllOff() {
 	for (uint8_t i = 0; i < queue_len; i++) {
 		TurnOffLED(led_queue[i][0], led_queue[i][1]);

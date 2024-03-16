@@ -56,6 +56,8 @@ TIM_HandleTypeDef htim21;
 
 /* USER CODE BEGIN PV */
 
+uint8_t DEBUG_MODE = 0; // When set, enables debug LED and USB output
+
 uint32_t adc_val;
 uint32_t prev_adc_val;
 uint8_t sample_flag = 0;	// Set when ADC needs to be sampled
@@ -63,6 +65,15 @@ uint8_t high_flag = 0;		// Set when heart beat has hit peak (high)
 uint8_t low_flag = 1;		// Set when heart beat has hit low/valley
 uint16_t heartbeat_count = 0;	// Store number of samples between beats
 uint16_t heartbeat_freq = 30; 	// In BPM
+
+// AUTO-CALIBRATING MIN/MAX
+#define CALIBRATION_WINDOW_LEN 1024	// Length of window to consider for min/max (smaller is quicker)
+uint16_t calibration_count = 0;
+uint16_t calibration_high = 2500;	// Value used in low to high comparison
+uint16_t calibration_low = 2400;	// Value used in high to low comparison
+uint16_t window_max = 0;
+uint16_t window_min = 0;
+
 
 uint8_t pattern_flag = 0; 	// Set when pattern handler needs called
 uint8_t button_flag = 0; 	// Set when button is pressed
@@ -138,16 +149,19 @@ int main(void)
   MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
 
-	// CHECK FOR BUTT1 PRESS, BUTT1 PRESS AT BOOT MEANS ENTER DFU MODE
+	// CHECK FOR BUTT1 PRESS, BUTT1 PRESS AT BOOT MEANS DEBUG MODE
 	if (HAL_GPIO_ReadPin(BUTT1_GPIO_Port, BUTT1_Pin) == GPIO_PIN_RESET) {
-		HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+		DEBUG_MODE = 1;
 	}
 
 	// Set LED timer periods/duty cycle
 	//TIM3->CCR1 = 99;
-	//TIM2->CCR1 = 99;
+	TIM2->CCR1 = 20;
 
-	// Timer to control LED patters
+	// Timer to control green LED
+	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+	// Timer to control LED patterns
 	HAL_TIM_Base_Start_IT(&htim21);
 	//HAL_TIM_OC_Start_IT(&htim21, TIM_CHANNEL_1);
 
@@ -171,10 +185,19 @@ int main(void)
 		if (pattern_flag) {
 			switch (pattern_select) {
 			case 0:
-				PulseHandler();
+				PulseHandler();			// Measured heartbeat
 				break;
 			case 1:
-				PulseHandlerKeepOn();
+				PulseHandlerKeepOn();	// Measured heartbeat
+				break;
+			case 2:
+				PrintRate(heartbeat_freq);	// Measured heartbeat
+				break;
+			case 3:
+				PulseHandler();			// Constant heartbeat
+				break;
+			case 4:
+				PulseHandlerKeepOn();	// Constant heartbeat
 				break;
 			}
 			pattern_flag = 0;
@@ -183,8 +206,13 @@ int main(void)
 		if (button_flag) {
 			pattern_select++;
 			ResetIndexes();
-			if (pattern_select > 1) {
-				pattern_select = 0;
+			if (pattern_select > 4) {
+				pattern_select = 0;							// Reset patterns
+				HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);	// Turn on green LED
+			}
+			else if (pattern_select > 2) {
+				HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);	// Turn off green LED
+				TIM21->ARR = 869;							// Preset heartbeat to 69 bpm to avoid glitches
 			}
 			button_flag = 0;
 		}
@@ -194,14 +222,57 @@ int main(void)
 			HAL_ADC_Start(&hadc);
 			HAL_ADC_PollForConversion(&hadc, 100);
 			adc_val = HAL_ADC_GetValue(&hadc);
-			//char buf[6];
-			//sprintf(buf, "%d\r\n", adc_val);
-			//CDC_Transmit_FS(buf, 6);
 
+			if (DEBUG_MODE) {
+				// REMOVE USB STUFF TO REDUCE FLICKER
+				char buf[10];
+				sprintf(buf, "%d %d\r\n", adc_val, heartbeat_freq);
+				if (heartbeat_freq >= 100) {
+					CDC_Transmit_FS(buf, 10);
+				}
+				else {
+					CDC_Transmit_FS(buf, 9);
+				}
+			}
+
+			// AUTO-CALIBRATION WINDOW STUFF
+			// Reset window once length is reached
+			calibration_count++;
+			if (calibration_count >= CALIBRATION_WINDOW_LEN) {
+				calibration_count = 0;
+
+				uint16_t window_mid = (window_max + window_min) >> 1;
+
+				// Can vary how much between
+				// Assign calibration_max between middle and max
+				calibration_high = window_mid + ((window_max - window_min) >> 2);
+
+				// Assign calibration min between middle and min
+				calibration_low = window_mid - ((window_mid - window_min) >> 2);
+
+				window_max = 0;
+				window_min = 4095;
+
+			}
+
+			// Record max and min values for next window's comparison
+			if (adc_val > window_max) {
+				window_max = adc_val;
+			}
+			else if (adc_val < window_min) {
+				window_min = adc_val;
+			}
+
+
+			// CALCULATING HEART RATE STUFF
 			heartbeat_count++;	// Increment time between beats
 
-			if (low_flag && adc_val >= 2200) {
-				HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+			// When signal goes low from high
+			if (low_flag && adc_val <= calibration_low) {
+
+				if (DEBUG_MODE) {
+					HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
+				}
 				low_flag = 0;
 				high_flag = 1;
 
@@ -219,9 +290,9 @@ int main(void)
 					heartbeat_freq = 199;
 				}
 
-				char buf[5];
-				sprintf(buf, "%d\r\n", heartbeat_freq);
-				CDC_Transmit_FS(buf, 5);
+				//char buf[5];
+				//sprintf(buf, "%d\r\n", heartbeat_freq);
+				//CDC_Transmit_FS(buf, 5);
 
 				/*
 				 *  DIVIDE ARR BY NUM OF PATTERN STAGES
@@ -232,13 +303,26 @@ int main(void)
 					ARR = 16,000,000 / 1600 / BPM * 60 / Stages
 				 */
 
-				// Range (2221 (30 BPM) to 332 (200 BPM)
-				TIM21->ARR = 16000000 / (TIM21->PSC+1) / heartbeat_freq * 60 / pattern_steps[pattern_select] - 1;
+				// When printing out numbers, just set constant timer frequency
+				if (pattern_select == 2) {
+					TIM21->ARR = 200;
+				}
+				else if (pattern_select > 2) {
+					TIM21->ARR = 869;
+				}
+				else {
+					// Range (2221 (30 BPM) to 332 (200 BPM)
+					TIM21->ARR = 16000000 / (TIM21->PSC+1) / heartbeat_freq * 60 / pattern_steps[pattern_select] - 1;
+				}
 
 				heartbeat_count = 0;
 			}
-			else if (high_flag && adc_val <= 2000) {
-				HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+			// When signal goes high from low
+			else if (high_flag && adc_val >= calibration_high) {
+
+				if (DEBUG_MODE) {
+					HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
+				}
 				low_flag = 1;
 				high_flag = 0;
 
@@ -379,6 +463,7 @@ static void MX_TIM2_Init(void)
 
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
 
   /* USER CODE BEGIN TIM2_Init 1 */
 
@@ -398,15 +483,28 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
   {
     Error_Handler();
   }
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
+  HAL_TIM_MspPostInit(&htim2);
 
 }
 
@@ -609,9 +707,6 @@ static void MX_GPIO_Init(void)
                           |C4_Pin|C5_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LEDG_GPIO_Port, LEDG_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, C6_Pin|C7_Pin|LED1_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
@@ -620,9 +715,9 @@ static void MX_GPIO_Init(void)
                           |A5_Pin|A6_Pin|A7_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : C0_Pin C1_Pin C2_Pin C3_Pin
-                           LEDG_Pin C4_Pin C5_Pin */
+                           C4_Pin C5_Pin */
   GPIO_InitStruct.Pin = C0_Pin|C1_Pin|C2_Pin|C3_Pin
-                          |LEDG_Pin|C4_Pin|C5_Pin;
+                          |C4_Pin|C5_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
