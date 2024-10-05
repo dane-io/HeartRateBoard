@@ -79,13 +79,13 @@ void TurnOffLED(uint8_t row, uint8_t col) {
 
 
 
-volatile uint8_t led_queue[ROWS*COLUMNS+1][2] = {};	// End of queue is 0xFF (255)
+uint8_t led_queue[ROWS*COLUMNS+1][2] = {};	// End of queue is 0xFF (255)
 //led_queue[ROWS*COLUMNS][0] = 0xFF;
 volatile uint8_t queue_index = 0;
-volatile uint8_t queue_len;
+uint8_t queue_len;
 
 // Make led_queue equal to led_list
-void SetLEDQueue( uint8_t* led_list[2], uint8_t len ) {
+void SetLEDQueue( uint8_t (*led_list)[][2], uint8_t len ) {
 	memcpy(led_queue, led_list, len*2);
 	//queue_len = sizeof(led_list)/2;
 	queue_len = len;
@@ -96,7 +96,7 @@ void SetLEDQueue( uint8_t* led_list[2], uint8_t len ) {
 }
 
 // Concatenate led_list to led_queue
-void AddToLEDQueue( uint8_t* led_list[2], uint8_t len ) {
+void AddToLEDQueue( uint8_t (*led_list)[][2], uint8_t len ) {
 	memcpy(led_queue+queue_len, led_list, len*2);
 	queue_len += len;
 	//queue_index = 0;
@@ -176,7 +176,7 @@ void PrintRate( uint8_t rate ) {
 	TurnAllOff();
 
 	if (rate >= 100) {
-		AddToLEDQueue(one_hundreds, 2);
+		AddToLEDQueue(&one_hundreds, 2);
 	}
 	AddToLEDQueue(tens_digits[tens], digit_sizes[tens]);
 	AddToLEDQueue(ones_digits[ones], digit_sizes[ones]);

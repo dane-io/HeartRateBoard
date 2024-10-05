@@ -26,6 +26,10 @@
 #include "usbd_cdc_if.h"
 #include "led_functions.h"
 
+// Follow these steps: https://community.st.com/t5/stm32-mcus/configuring-dsp-libraries-on-stm32cubeide/ta-p/49637
+#include "arm_math.h"
+#include "arm_const_structs.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -53,6 +57,7 @@ TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim21;
+TIM_HandleTypeDef htim22;
 
 /* USER CODE BEGIN PV */
 
@@ -67,7 +72,16 @@ uint16_t heartbeat_count = 0;	// Store number of samples between beats
 uint16_t heartbeat_freq = 30; 	// In BPM
 
 // AUTO-CALIBRATING MIN/MAX
-#define CALIBRATION_WINDOW_LEN 1024	// Length of window to consider for min/max (smaller is quicker)
+#define WINDOW_LEN 256			// Length of window to consider for min/max (smaller is quicker)
+#define WINDOW_LEN_PWR 8		// Used for bit shifting instead of dividing
+#define FFT_MULTIPLIER 4		// Define how much zero padding you want
+#define FFT_MULTIPLIER_PWR 2	// Used for bit shifting instead of dividing
+#define FFT_LEN (WINDOW_LEN*FFT_MULTIPLIER)
+#define FFT_LEN_PWR (WINDOW_LEN_PWR+FFT_MULTIPLIER_PWR)	// Used for bit shifting instead of dividing
+
+int16_t window_values[WINDOW_LEN] = {0};
+
+uint16_t window_index = 0;
 uint16_t calibration_count = 0;
 uint16_t calibration_high = 2500;	// Value used in low to high comparison
 uint16_t calibration_low = 2400;	// Value used in high to low comparison
@@ -80,6 +94,7 @@ uint8_t button_flag = 0; 	// Set when button is pressed
 uint8_t button_prev = GPIO_PIN_SET;	// Previous state of button
 uint8_t button_state;
 uint8_t pattern_select = 0;
+uint8_t led_timer_lock_flag = 0;	// When set, don't Handle LED queue in interrupt
 
 /* USER CODE END PV */
 
@@ -92,6 +107,7 @@ static void MX_TIM3_Init(void);
 static void MX_TIM21_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_TIM7_Init(void);
+static void MX_TIM22_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -147,6 +163,7 @@ int main(void)
   MX_TIM21_Init();
   MX_TIM6_Init();
   MX_TIM7_Init();
+  MX_TIM22_Init();
   /* USER CODE BEGIN 2 */
 
 	// CHECK FOR BUTT1 PRESS, BUTT1 PRESS AT BOOT MEANS DEBUG MODE
@@ -160,6 +177,9 @@ int main(void)
 
 	// Timer to control green LED
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+	// Timer to control LED queue
+	HAL_TIM_Base_Start_IT(&htim22);
 
 	// Timer to control LED patterns
 	HAL_TIM_Base_Start_IT(&htim21);
@@ -181,8 +201,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 
-		HandleLEDQueue();
+		//HandleLEDQueue(); // Now handled in timer interrupt for asynchronous
 		if (pattern_flag) {
+			led_timer_lock_flag = 1;
 			switch (pattern_select) {
 			case 0:
 				PulseHandler();			// Measured heartbeat
@@ -201,11 +222,14 @@ int main(void)
 				break;
 			}
 			pattern_flag = 0;
+			led_timer_lock_flag = 0;
 		}
 
 		if (button_flag) {
 			pattern_select++;
+			led_timer_lock_flag = 1;
 			ResetIndexes();
+			led_timer_lock_flag = 0;
 			if (pattern_select > 4) {
 				pattern_select = 0;							// Reset patterns
 				HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);	// Turn on green LED
@@ -225,114 +249,112 @@ int main(void)
 
 			if (DEBUG_MODE) {
 				// REMOVE USB STUFF TO REDUCE FLICKER
-				char buf[10];
-				sprintf(buf, "%d %d\r\n", adc_val, heartbeat_freq);
+				char buf[32] = {0};
+				sprintf(buf, "%d %d\r\n", (uint16_t)adc_val, heartbeat_freq);
 				if (heartbeat_freq >= 100) {
-					CDC_Transmit_FS(buf, 10);
+					CDC_Transmit_FS((uint8_t*)&buf, 10);
 				}
 				else {
-					CDC_Transmit_FS(buf, 9);
+					CDC_Transmit_FS((uint8_t*)&buf, 9);
 				}
 			}
 
-			// AUTO-CALIBRATION WINDOW STUFF
-			// Reset window once length is reached
-			calibration_count++;
-			if (calibration_count >= CALIBRATION_WINDOW_LEN) {
-				calibration_count = 0;
-
-				uint16_t window_mid = (window_max + window_min) >> 1;
-
-				// Can vary how much between
-				// Assign calibration_max between middle and max
-				calibration_high = window_mid + ((window_max - window_min) >> 2);
-
-				// Assign calibration min between middle and min
-				calibration_low = window_mid - ((window_mid - window_min) >> 2);
-
-				window_max = 0;
-				window_min = 4095;
-
-			}
-
-			// Record max and min values for next window's comparison
-			if (adc_val > window_max) {
-				window_max = adc_val;
-			}
-			else if (adc_val < window_min) {
-				window_min = adc_val;
-			}
-
-
-			// CALCULATING HEART RATE STUFF
-			heartbeat_count++;	// Increment time between beats
-
-			// When signal goes low from high
-			if (low_flag && adc_val <= calibration_low) {
-
-				if (DEBUG_MODE) {
-					HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_RESET);
-				}
-				low_flag = 0;
-				high_flag = 1;
-
-				// Sampling time:
-				uint16_t sample_freq = 16000000 / (TIM7->PSC+1) / (TIM7->ARR+1);	// In Hz
-
-				// In Hz = 1 / ( Counts * (1/Fs) ) = Fs / Counts
-				heartbeat_freq = sample_freq * 60 / heartbeat_count; // In BPM
-
-				// Limit between 30 BPM and 200 BPM
-				if (heartbeat_freq < 30) {
-					heartbeat_freq = 30;
-				}
-				else if (heartbeat_freq > 199){
-					heartbeat_freq = 199;
-				}
-
-				//char buf[5];
-				//sprintf(buf, "%d\r\n", heartbeat_freq);
-				//CDC_Transmit_FS(buf, 5);
-
-				/*
-				 *  DIVIDE ARR BY NUM OF PATTERN STAGES
-					16,000,000 Hz / 1600 / 20,0000 / 1 = 0.5 Hz
-					16,000,000 Hz / 1600 / 3,000 / 1 = 3.333 Hz
-
-					ARR = 16,000,000 / 1600 / (BPM/60)
-					ARR = 16,000,000 / 1600 / BPM * 60 / Stages
-				 */
-
-				// When printing out numbers, just set constant timer frequency
-				if (pattern_select == 2) {
-					TIM21->ARR = 200;
-				}
-				else if (pattern_select > 2) {
-					TIM21->ARR = 869;
-				}
-				else {
-					// Range (2221 (30 BPM) to 332 (200 BPM)
-					TIM21->ARR = 16000000 / (TIM21->PSC+1) / heartbeat_freq * 60 / pattern_steps[pattern_select] - 1;
-				}
-
-				heartbeat_count = 0;
-			}
-			// When signal goes high from low
-			else if (high_flag && adc_val >= calibration_high) {
-
-				if (DEBUG_MODE) {
-					HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);
-				}
-				low_flag = 1;
-				high_flag = 0;
-
-
-
-			}
-
+			window_values[window_index] = adc_val;
+			window_index++;
 			prev_adc_val = adc_val;
 			sample_flag = 0;
 		}
+
+		// Process window once window is filled
+		if (window_index == WINDOW_LEN) {
+			// Compute average
+			int16_t window_avg = 0;
+			int32_t window_avg_sum = 0;
+			for (uint16_t i =0; i < WINDOW_LEN; i++) {
+				window_avg_sum += window_values[i];
+			}
+			window_avg = window_avg_sum >> WINDOW_LEN_PWR;	// Quick divide (assume length is power of 2)
+
+			// Vectors for FFT processing
+			q15_t window_real[FFT_LEN] = {0};
+			q15_t window_complex[2*FFT_LEN] = {0};		// First two data points are X[0] (DC) and X[N/2] (Nyquist)
+			q15_t window_fft_mag[FFT_LEN] = {0};
+
+			// Set real data to be window + zero padding
+			for (uint16_t i = 0; i < WINDOW_LEN; i++) {
+				window_real[i] = (int16_t)window_values[i] - window_avg;
+			}
+
+			// Compute real FFT of data
+			uint32_t ifftFlag = 0;
+			uint32_t bitRevFlag = 1;
+			arm_rfft_instance_q15 fft_instance;
+			arm_rfft_init_q15(&fft_instance, FFT_LEN, ifftFlag, bitRevFlag);		// ifftFlag = 0 for regular (not inverse) FFT, bitRev = 1 for output to be in normal order
+			arm_rfft_q15(&fft_instance, window_real, window_complex);
+			arm_shift_q15(window_complex, FFT_LEN_PWR-1, window_complex, FFT_LEN);	// Bit shift 7 for FFT of length 256 per the documentation?
+			arm_cmplx_mag_q15(window_complex, window_fft_mag, FFT_LEN);
+
+			// Sampling time: (should be 25 Hz right now)
+			uint16_t sample_freq = SystemCoreClock / (TIM7->PSC+1) / (TIM7->ARR+1);	// In Hz
+
+			// Only look at FFT values in the range we're interested in
+			uint16_t min_index = 30 * FFT_LEN / sample_freq / 60;
+			uint16_t max_index = 199 * FFT_LEN / sample_freq / 60;
+
+			// Find largest peak in first half of FFT (positive frequencies)
+			int16_t max_peak = 0;
+			uint16_t max_peak_index = 0;
+			for (uint16_t i = min_index; i < max_index; i++) {
+				if (window_fft_mag[i] >= max_peak) {
+					max_peak = window_fft_mag[i];
+					max_peak_index = i;
+				}
+			}
+
+			// Compute heartbeat from FFT index
+			float heart_beat_float = (float)max_peak_index / (float)FFT_LEN * (float)sample_freq*60.0;
+			heartbeat_freq = (uint16_t)heart_beat_float;
+
+			/*
+			// Print max FFT index
+			if (DEBUG_MODE) {
+				char buf[32] = {0};
+				sprintf(buf, "FFT peak: %d\r\n", (uint16_t)heart_beat_float);
+				CDC_Transmit_FS((uint8_t*)&buf, strlen(buf));
+			}
+			*/
+
+			// Limit between 30 BPM and 200 BPM
+			if (heartbeat_freq < 30) {
+				heartbeat_freq = 30;
+			}
+			else if (heartbeat_freq > 199){
+				heartbeat_freq = 199;
+			}
+
+			//  DIVIDE ARR BY NUM OF PATTERN STAGES
+			//  16,000,000 Hz / 1600 / 20,0000 / 1 = 0.5 Hz
+			//  16,000,000 Hz / 1600 / 3,000 / 1 = 3.333 Hz
+
+			//	ARR = 16,000,000 / 1600 / (BPM/60)
+			//	ARR = 16,000,000 / 1600 / BPM * 60 / Stages
+
+			// When printing out numbers, just set constant timer frequency
+			if (pattern_select == 2) {
+				TIM21->ARR = 200;
+			}
+			// Default BPM for non sampling modes
+			else if (pattern_select > 2) {
+				TIM21->ARR = 869;
+			}
+			// Adjust pattern to BPM
+			else {
+				// Range (2221 (30 BPM) to 332 (200 BPM)
+				TIM21->ARR = SystemCoreClock / (TIM21->PSC+1) / heartbeat_freq * 60 / pattern_steps[pattern_select] - 1;
+			}
+
+			window_index = 0;
+		}	// End of processing window
 
 		//HAL_Delay(1);
 
@@ -469,7 +491,7 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 16-1;
+  htim2.Init.Prescaler = 32-1;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 100-1;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -527,7 +549,7 @@ static void MX_TIM3_Init(void)
 
   /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 16-1;
+  htim3.Init.Prescaler = 32-1;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim3.Init.Period = 100-1;
   htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -571,7 +593,7 @@ static void MX_TIM6_Init(void)
 
   /* USER CODE END TIM6_Init 1 */
   htim6.Instance = TIM6;
-  htim6.Init.Prescaler = 1600-1;
+  htim6.Init.Prescaler = 3200-1;
   htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim6.Init.Period = 100-1;
   htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -609,9 +631,9 @@ static void MX_TIM7_Init(void)
 
   /* USER CODE END TIM7_Init 1 */
   htim7.Instance = TIM7;
-  htim7.Init.Prescaler = 100-1;
+  htim7.Init.Prescaler = 200-1;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim7.Init.Period = 320-1;
+  htim7.Init.Period = 3200-1;
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
   {
@@ -688,6 +710,64 @@ static void MX_TIM21_Init(void)
 }
 
 /**
+  * @brief TIM22 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM22_Init(void)
+{
+
+  /* USER CODE BEGIN TIM22_Init 0 */
+
+  /* USER CODE END TIM22_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+
+  /* USER CODE BEGIN TIM22_Init 1 */
+
+  /* USER CODE END TIM22_Init 1 */
+  htim22.Instance = TIM22;
+  htim22.Init.Prescaler = 160-1;
+  htim22.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim22.Init.Period = 20-1;
+  htim22.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim22.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim22) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim22, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_TIM_OC_Init(&htim22) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim22, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sConfigOC.OCMode = TIM_OCMODE_TIMING;
+  sConfigOC.Pulse = 0;
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_OC_ConfigChannel(&htim22, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM22_Init 2 */
+
+  /* USER CODE END TIM22_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -748,30 +828,37 @@ static void MX_GPIO_Init(void)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-  // Check if timer to control pattern steps
-  if (htim == &htim21)
-  {
-	  //PulseHandler();
-	  pattern_flag = 1;
-	  //HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+	// Check if timer to handle LED flashing
+	if (htim == &htim22 && led_timer_lock_flag != 1) {
+		// NOTE, I AM DANGEROUSLY ALLOWING INTERRUPT TO CALL MULTIPLE TIMES FOR OPTIMAL SPEED
+		// TOOK SOME GUESSING TO GET THIS TO WORK
+		HandleLEDQueue();
+	}
 
-  }
-  // Check if timer to sample button press
-  else if (htim == &htim6) {
-	  button_state = HAL_GPIO_ReadPin(BUTT1_GPIO_Port, BUTT1_Pin);
-	  if (button_state == GPIO_PIN_RESET && button_prev == GPIO_PIN_SET) {
-		  button_flag = 1;
-		  button_prev = GPIO_PIN_RESET;
-	  }
-	  else if (button_state == GPIO_PIN_SET && button_prev == GPIO_PIN_RESET) {
-		  button_prev = GPIO_PIN_SET;
-	  }
+	// Check if timer to control pattern steps
+	else if (htim == &htim21)
+	{
+		//PulseHandler();
+		pattern_flag = 1;
+		//HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
 
-  }
-  // Check if timer to sample ADC
-  else if (htim == &htim7) {
-	  sample_flag = 1;
-  }
+	}
+	// Check if timer to sample button press
+	else if (htim == &htim6) {
+		button_state = HAL_GPIO_ReadPin(BUTT1_GPIO_Port, BUTT1_Pin);
+		if (button_state == GPIO_PIN_RESET && button_prev == GPIO_PIN_SET) {
+			button_flag = 1;
+			button_prev = GPIO_PIN_RESET;
+		}
+		else if (button_state == GPIO_PIN_SET && button_prev == GPIO_PIN_RESET) {
+			button_prev = GPIO_PIN_SET;
+		}
+
+	}
+	// Check if timer to sample ADC
+	else if (htim == &htim7) {
+		sample_flag = 1;
+	}
 }
 
 /* USER CODE END 4 */

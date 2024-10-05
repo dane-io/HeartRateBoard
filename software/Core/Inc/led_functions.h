@@ -18,8 +18,8 @@ static const uint8_t pattern_steps[3] = {10, 10, 10};
 
 void TurnOnLED(uint8_t row, uint8_t col);
 void TurnOffLED(uint8_t row, uint8_t col);
-void SetLEDQueue( uint8_t* LED_list[2], uint8_t len );
-void AddToLEDQueue( uint8_t* LED_list[2], uint8_t len );
+void SetLEDQueue( uint8_t (*led_list)[][2], uint8_t len );
+void AddToLEDQueue( uint8_t (*led_list)[][2], uint8_t len );
 void HandleLEDQueue();
 void PulseHandler();
 void PulseHandlerKeepOn();

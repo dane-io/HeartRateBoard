@@ -65,7 +65,7 @@ main-build: HeartSensorBoard.elf secondary-outputs
 
 # Tool invocations
 HeartSensorBoard.elf HeartSensorBoard.map: $(OBJS) $(USER_OBJS) C:\Users\Dane\Documents\GitHub\HeartRateBoard\software\STM32L072CBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "HeartSensorBoard.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0plus -T"C:\Users\Dane\Documents\GitHub\HeartRateBoard\software\STM32L072CBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="HeartSensorBoard.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+	arm-none-eabi-gcc -o "HeartSensorBoard.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m0plus -T"C:\Users\Dane\Documents\GitHub\HeartRateBoard\software\STM32L072CBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="HeartSensorBoard.map" -Wl,--gc-sections -static -L"C:\Users\Dane\Documents\GitHub\HeartRateBoard\software\Drivers\CMSIS\Lib\GCC" --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 
