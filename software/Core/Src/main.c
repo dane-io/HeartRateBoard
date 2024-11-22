@@ -64,7 +64,6 @@ TIM_HandleTypeDef htim22;
 uint8_t DEBUG_MODE = 0; // When set, enables debug LED and USB output
 
 uint32_t adc_val;
-uint32_t prev_adc_val;
 uint8_t sample_flag = 0;	// Set when ADC needs to be sampled
 uint8_t high_flag = 0;		// Set when heart beat has hit peak (high)
 uint8_t low_flag = 1;		// Set when heart beat has hit low/valley
@@ -93,23 +92,6 @@ arm_fir_instance_q15 S_ZEROS;
 q15_t BPM_Filt_Coeffs[NUM_BPM_TAPS] = {4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096};
 q15_t BPM_Filt_State[NUM_BPM_TAPS] = {0};
 arm_fir_instance_q15 S_BPM;
-
-// AUTO-CALIBRATING MIN/MAX
-#define WINDOW_LEN 256			// Length of window to consider for min/max (smaller is quicker)
-#define WINDOW_LEN_PWR 8		// Used for bit shifting instead of dividing
-#define FFT_MULTIPLIER 4		// Define how much zero padding you want
-#define FFT_MULTIPLIER_PWR 2	// Used for bit shifting instead of dividing
-#define FFT_LEN (WINDOW_LEN*FFT_MULTIPLIER)
-#define FFT_LEN_PWR (WINDOW_LEN_PWR+FFT_MULTIPLIER_PWR)	// Used for bit shifting instead of dividing
-
-int16_t window_values[WINDOW_LEN] = {0};
-
-uint16_t window_index = 0;
-uint16_t calibration_count = 0;
-uint16_t calibration_high = 2500;	// Value used in low to high comparison
-uint16_t calibration_low = 2400;	// Value used in high to low comparison
-uint16_t window_max = 0;
-uint16_t window_min = 0;
 
 
 uint8_t pattern_flag = 0; 	// Set when pattern handler needs called
@@ -148,6 +130,7 @@ int main(void)
 {
 	/* USER CODE BEGIN 1 */
 
+	// Deprecated
 	extern TIM_HandleTypeDef *cathode_timers[ROWS];
 	cathode_timers[0] = &htim2;
 	cathode_timers[1] = &htim2;
@@ -196,7 +179,7 @@ int main(void)
 
 	// Set LED timer periods/duty cycle
 	//TIM3->CCR1 = 99;
-	TIM2->CCR1 = 20;
+	TIM2->CCR1 = 20;	// Period is 100-1, lower number here is higher duty cycle
 
 	// Timer to control green LED
 	HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
@@ -239,7 +222,7 @@ int main(void)
 
 		/* USER CODE BEGIN 3 */
 
-		//HandleLEDQueue(); // Now handled in timer interrupt for asynchronous
+		// Handle pattern flag
 		if (pattern_flag) {
 			led_timer_lock_flag = 1;
 			switch (pattern_select) {
@@ -263,6 +246,7 @@ int main(void)
 			led_timer_lock_flag = 0;
 		}
 
+		// Handle button press
 		if (button_flag) {
 			pattern_select++;
 			led_timer_lock_flag = 1;
@@ -279,37 +263,30 @@ int main(void)
 			button_flag = 0;
 		}
 
+		// Handle sampling ADC and processing
 		if (sample_flag) {
-
+			// Sample ADC and clear flag. Pray that timer is slow enough that the timing works out
 			HAL_ADC_Start(&hadc);
 			HAL_ADC_PollForConversion(&hadc, 100);
 			adc_val = HAL_ADC_GetValue(&hadc);
+			sample_flag = 0;
 
+			// Run filters to process data for zero crossing estimation
 			int16_t filter_input = (int16_t)adc_val - 2048;
 			int16_t filtered_sample;
 			int16_t filtered_avg;
 			arm_fir_fast_q15(&S_FIR, &filter_input, &filtered_sample, 1);
 			arm_fir_fast_q15(&S_ZEROS, &filtered_sample, &filtered_avg, 1);
 
-
+			// If in debug mode, report signal and estimated heart rate
 			if (DEBUG_MODE) {
 				// REMOVE USB STUFF TO REDUCE FLICKER
 				char buf[32] = {0};
-				sprintf(buf, "%d %d\r\n", (int16_t)filtered_sample, heartbeat_freq);
-				if (heartbeat_freq >= 100) {
-					CDC_Transmit_FS((uint8_t*)&buf, 10);
-				}
-				else {
-					CDC_Transmit_FS((uint8_t*)&buf, 9);
-				}
+				sprintf(buf, "%d %d\r\n", (int)adc_val, heartbeat_freq);
+				CDC_Transmit_FS((uint8_t*)&buf, strlen(buf));
 			}
 
-			window_values[window_index] = adc_val;
-			// TODO:
-			//window_index++;
-			prev_adc_val = adc_val;
-			sample_flag = 0;
-
+			// Detect time (samples) between zero crossings
 			sample_count++; // Increment sample count
 
 			// If signal goes from low to high
@@ -369,101 +346,9 @@ int main(void)
 				}
 				sample_count = 0;	// Reset sample count
 
-			}
-		}
+			}	// Done handling high to low transient
+		}	// Done handling ADC sample
 
-		// Process window once window is filled
-		if (window_index == WINDOW_LEN) {
-			// Compute average
-			int16_t window_avg = 0;
-			int32_t window_avg_sum = 0;
-			for (uint16_t i =0; i < WINDOW_LEN; i++) {
-				window_avg_sum += window_values[i];
-			}
-			window_avg = window_avg_sum >> WINDOW_LEN_PWR;	// Quick divide (assume length is power of 2)
-
-			// Vectors for FFT processing
-			q15_t window_real[FFT_LEN] = {0};
-			q15_t window_complex[2*FFT_LEN] = {0};		// First two data points are X[0] (DC) and X[N/2] (Nyquist)
-			q15_t window_fft_mag[FFT_LEN] = {0};
-
-			// Set real data to be window + zero padding
-			for (uint16_t i = 0; i < WINDOW_LEN; i++) {
-				window_real[i] = (int16_t)window_values[i] - window_avg;
-			}
-
-			// Compute real FFT of data
-			uint32_t ifftFlag = 0;
-			uint32_t bitRevFlag = 1;
-			arm_rfft_instance_q15 fft_instance;
-			arm_rfft_init_q15(&fft_instance, FFT_LEN, ifftFlag, bitRevFlag);		// ifftFlag = 0 for regular (not inverse) FFT, bitRev = 1 for output to be in normal order
-			arm_rfft_q15(&fft_instance, window_real, window_complex);
-			arm_shift_q15(window_complex, FFT_LEN_PWR-1, window_complex, FFT_LEN);	// Bit shift 7 for FFT of length 256 per the documentation?
-			arm_cmplx_mag_q15(window_complex, window_fft_mag, FFT_LEN);
-
-			// Sampling time: (should be 25 Hz right now)
-			uint16_t sample_freq = SystemCoreClock / (TIM7->PSC+1) / (TIM7->ARR+1);	// In Hz
-
-			// Only look at FFT values in the range we're interested in
-			uint16_t min_index = 30 * FFT_LEN / sample_freq / 60;
-			uint16_t max_index = 199 * FFT_LEN / sample_freq / 60;
-
-			// Find largest peak in first half of FFT (positive frequencies)
-			int16_t max_peak = 0;
-			uint16_t max_peak_index = 0;
-			for (uint16_t i = min_index; i < max_index; i++) {
-				if (window_fft_mag[i] >= max_peak) {
-					max_peak = window_fft_mag[i];
-					max_peak_index = i;
-				}
-			}
-
-			// Compute heartbeat from FFT index
-			float heart_beat_float = (float)max_peak_index / (float)FFT_LEN * (float)sample_freq*60.0;
-			heartbeat_freq = (uint16_t)heart_beat_float;
-
-			/*
-			// Print max FFT index
-			if (DEBUG_MODE) {
-				char buf[32] = {0};
-				sprintf(buf, "FFT peak: %d\r\n", (uint16_t)heart_beat_float);
-				CDC_Transmit_FS((uint8_t*)&buf, strlen(buf));
-			}
-			 */
-
-			// Limit between 30 BPM and 200 BPM
-			if (heartbeat_freq < 30) {
-				heartbeat_freq = 30;
-			}
-			else if (heartbeat_freq > 199){
-				heartbeat_freq = 199;
-			}
-
-			//  DIVIDE ARR BY NUM OF PATTERN STAGES
-			//  16,000,000 Hz / 1600 / 20,0000 / 1 = 0.5 Hz
-			//  16,000,000 Hz / 1600 / 3,000 / 1 = 3.333 Hz
-
-			//	ARR = 16,000,000 / 1600 / (BPM/60)
-			//	ARR = 16,000,000 / 1600 / BPM * 60 / Stages
-
-			// When printing out numbers, just set constant timer frequency
-			if (pattern_select == 2) {
-				TIM21->ARR = 200;
-			}
-			// Default BPM for non sampling modes
-			else if (pattern_select > 2) {
-				TIM21->ARR = 869;
-			}
-			// Adjust pattern to BPM
-			else {
-				// Range (2221 (30 BPM) to 332 (200 BPM)
-				TIM21->ARR = SystemCoreClock / (TIM21->PSC+1) / heartbeat_freq * 60 / pattern_steps[pattern_select] - 1;
-			}
-
-			window_index = 0;
-		}	// End of processing window
-
-		//HAL_Delay(1);
 
 	}
 	/* USER CODE END 3 */

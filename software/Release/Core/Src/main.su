@@ -1,4 +1,4 @@
-../Core/Src/main.c:476:6:SystemClock_Config	120	static,ignoring_inline_asm
-../Core/Src/main.c:147:5:main	8272	static,ignoring_inline_asm
-../Core/Src/main.c:936:6:HAL_TIM_PeriodElapsedCallback	8	static
-../Core/Src/main.c:977:6:Error_Handler	0	static,ignoring_inline_asm
+../Core/Src/main.c:361:6:SystemClock_Config	120	static,ignoring_inline_asm
+../Core/Src/main.c:129:5:main	120	static,ignoring_inline_asm
+../Core/Src/main.c:821:6:HAL_TIM_PeriodElapsedCallback	8	static
+../Core/Src/main.c:862:6:Error_Handler	0	static,ignoring_inline_asm
